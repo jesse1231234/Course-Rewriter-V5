@@ -190,7 +190,6 @@ def build_rewrite_prompt(
 
         Requirements:
         - Preserve semantics and learning intent of the original.
-        - Placeholders like ⟪IFRAME:n⟫ represent protected iframes—do not add, remove, or reorder them.
         - Follow the policy. Return only HTML, no explanations.
         - Reformat the HTML using DesignPLUS styling.
         - Do not change the written content of the page, only the design.
