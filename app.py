@@ -1,4 +1,3 @@
-# app.py
 import os
 import textwrap
 from typing import List, Dict, Any, Optional
@@ -7,6 +6,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from openai import OpenAI
+
 
 # ---------- CONFIG / CLIENTS ----------
 
@@ -18,6 +18,19 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+def get_canvas_config() -> tuple[str, str]:
+    """Fetch Canvas base URL and API token from secrets/env, or stop if missing."""
+    base_url = st.secrets.get("CANVAS_BASE_URL", None) or os.getenv("CANVAS_BASE_URL")
+    token = st.secrets.get("CANVAS_API_TOKEN", None) or os.getenv("CANVAS_API_TOKEN")
+    if not base_url or not token:
+        st.error(
+            "Canvas API configuration missing. Please set CANVAS_BASE_URL and "
+            "CANVAS_API_TOKEN in Streamlit secrets or environment."
+        )
+        st.stop()
+    return base_url.rstrip("/"), token
+
+
 # ---------- CANVAS HELPERS ----------
 
 def canvas_headers(token: str) -> Dict[str, str]:
@@ -26,16 +39,38 @@ def canvas_headers(token: str) -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
+
 def get_course(base_url: str, token: str, course_id: str) -> Dict[str, Any]:
     url = f"{base_url}/api/v1/courses/{course_id}"
     resp = requests.get(url, headers=canvas_headers(token))
     resp.raise_for_status()
     return resp.json()
 
+
+def _paginate_canvas(base_url: str, token: str, url: str, params: Optional[Dict[str, Any]] = None):
+    """Generic Canvas pagination helper (not heavily used here, but available)."""
+    headers = canvas_headers(token)
+    items: List[Any] = []
+    while url:
+        resp = requests.get(url, headers=headers, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        items.extend(data if isinstance(data, list) else data)
+        link = resp.headers.get("Link", "")
+        next_url = None
+        for part in link.split(","):
+            if 'rel="next"' in part:
+                next_url = part[part.find("<") + 1 : part.find(">")]
+                break
+        url = next_url
+        params = None  # only on first call
+    return items
+
+
 def get_pages(base_url: str, token: str, course_id: str, max_items: Optional[int] = None) -> List[Dict[str, Any]]:
     """Return list of full page objects (with body)."""
     headers = canvas_headers(token)
-    items = []
+    items: List[Dict[str, Any]] = []
     url = f"{base_url}/api/v1/courses/{course_id}/pages"
     params = {"per_page": 100}
 
@@ -57,15 +92,16 @@ def get_pages(base_url: str, token: str, course_id: str, max_items: Optional[int
         next_url = None
         for part in link.split(","):
             if 'rel="next"' in part:
-                next_url = part[part.find("<")+1:part.find(">")]
+                next_url = part[part.find("<") + 1 : part.find(">")]
                 break
         url = next_url
 
     return items
 
+
 def get_assignments(base_url: str, token: str, course_id: str, max_items: Optional[int] = None) -> List[Dict[str, Any]]:
     headers = canvas_headers(token)
-    items = []
+    items: List[Dict[str, Any]] = []
     url = f"{base_url}/api/v1/courses/{course_id}/assignments"
     params = {"per_page": 100}
 
@@ -81,15 +117,16 @@ def get_assignments(base_url: str, token: str, course_id: str, max_items: Option
         next_url = None
         for part in link.split(","):
             if 'rel="next"' in part:
-                next_url = part[part.find("<")+1:part.find(">")]
+                next_url = part[part.find("<") + 1 : part.find(">")]
                 break
         url = next_url
 
     return items
 
+
 def get_discussions(base_url: str, token: str, course_id: str, max_items: Optional[int] = None) -> List[Dict[str, Any]]:
     headers = canvas_headers(token)
-    items = []
+    items: List[Dict[str, Any]] = []
     url = f"{base_url}/api/v1/courses/{course_id}/discussion_topics"
     params = {"per_page": 100}
 
@@ -105,7 +142,7 @@ def get_discussions(base_url: str, token: str, course_id: str, max_items: Option
         next_url = None
         for part in link.split(","):
             if 'rel="next"' in part:
-                next_url = part[part.find("<")+1:part.find(">")]
+                next_url = part[part.find("<") + 1 : part.find(">")]
                 break
         url = next_url
 
@@ -113,7 +150,6 @@ def get_discussions(base_url: str, token: str, course_id: str, max_items: Option
 
 
 def update_page_html(base_url: str, token: str, course_id: str, url_slug: str, html: str) -> None:
-    # PUT /api/v1/courses/:course_id/pages/:url with wiki_page[body]:contentReference[oaicite:8]{index=8}
     endpoint = f"{base_url}/api/v1/courses/{course_id}/pages/{url_slug}"
     payload = {"wiki_page": {"body": html}}
     resp = requests.put(endpoint, headers=canvas_headers(token), json=payload)
@@ -121,7 +157,6 @@ def update_page_html(base_url: str, token: str, course_id: str, url_slug: str, h
 
 
 def update_assignment_html(base_url: str, token: str, course_id: str, assignment_id: int, html: str) -> None:
-    # PUT /api/v1/courses/:course_id/assignments/:id with assignment[description]:contentReference[oaicite:9]{index=9}
     endpoint = f"{base_url}/api/v1/courses/{course_id}/assignments/{assignment_id}"
     payload = {"assignment": {"description": html}}
     resp = requests.put(endpoint, headers=canvas_headers(token), json=payload)
@@ -129,7 +164,6 @@ def update_assignment_html(base_url: str, token: str, course_id: str, assignment
 
 
 def update_discussion_html(base_url: str, token: str, course_id: str, topic_id: int, html: str) -> None:
-    # PUT /api/v1/courses/:course_id/discussion_topics/:topic_id with message:contentReference[oaicite:10]{index=10}
     endpoint = f"{base_url}/api/v1/courses/{course_id}/discussion_topics/{topic_id}"
     payload = {"message": html}
     resp = requests.put(endpoint, headers=canvas_headers(token), json=payload)
@@ -229,33 +263,26 @@ st.set_page_config(page_title="Canvas Course Rewriter", layout="wide")
 st.title("Canvas Course Rewriter (Streamlit)")
 
 st.sidebar.header("Canvas connection")
-canvas_base_url = st.sidebar.text_input(
-    "Canvas base URL",
-    help="Example: https://colostate.instructure.com",
-)
-canvas_token = st.sidebar.text_input(
-    "Canvas API token",
-    type="password",
-    help="A personal access token or OAuth token with permission to read/write course content.",
-)
+
+# Only ID is entered by user; base URL + token come from secrets
 target_course_id = st.sidebar.text_input(
     "Target course ID",
     help="Numeric ID from the Canvas course URL (e.g. .../courses/205033).",
 )
 
 if st.sidebar.button("Fetch course content"):
-
-    if not (canvas_base_url and canvas_token and target_course_id):
-        st.sidebar.error("Please provide base URL, token, and course ID.")
+    if not target_course_id:
+        st.sidebar.error("Please provide a target course ID.")
     else:
+        base_url, token = get_canvas_config()
         try:
             with st.spinner("Fetching pages, assignments, and discussions from Canvas…"):
                 # verify course exists (optional)
-                _ = get_course(canvas_base_url, canvas_token, target_course_id)
+                _ = get_course(base_url, token, target_course_id)
 
-                pages = get_pages(canvas_base_url, canvas_token, target_course_id)
-                assignments = get_assignments(canvas_base_url, canvas_token, target_course_id)
-                discussions = get_discussions(canvas_base_url, canvas_token, target_course_id)
+                pages = get_pages(base_url, token, target_course_id)
+                assignments = get_assignments(base_url, token, target_course_id)
+                discussions = get_discussions(base_url, token, target_course_id)
 
                 content_items: List[Dict[str, Any]] = []
 
@@ -352,15 +379,16 @@ elif model_source == "Use Canvas model course":
         step=1,
     )
     if st.button("Fetch model course content"):
-        if not (canvas_base_url and canvas_token and model_course_id):
-            st.error("Canvas base URL, token, and model course ID are required.")
+        if not model_course_id:
+            st.error("Model course ID is required.")
         else:
+            base_url, token = get_canvas_config()
             try:
                 with st.spinner("Fetching model course content…"):
                     # Simple strategy: a few pages, assignments, discussions
-                    pages_m = get_pages(canvas_base_url, canvas_token, model_course_id, max_items=max_model_items)
-                    assignments_m = get_assignments(canvas_base_url, canvas_token, model_course_id, max_items=max_model_items)
-                    discussions_m = get_discussions(canvas_base_url, canvas_token, model_course_id, max_items=max_model_items)
+                    pages_m = get_pages(base_url, token, model_course_id, max_items=max_model_items)
+                    assignments_m = get_assignments(base_url, token, model_course_id, max_items=max_model_items)
+                    discussions_m = get_discussions(base_url, token, model_course_id, max_items=max_model_items)
 
                     model_snippets = []
 
@@ -433,7 +461,7 @@ if st.button("Run rewrite on all items", disabled=not can_run_rewrite):
     status_area.write("Rewrite complete.")
 
 
-# ---------- STEP 4: REVIEW & APPROVAL ----------
+# ---------- STEP 4: REVIEW & APPROVAL (VISUAL ONLY) ----------
 
 st.header("Step 4 – Review and approve changes")
 
@@ -449,26 +477,17 @@ else:
             col1, col2 = st.columns(2)
 
             with col1:
-                st.subheader("Original (rendered)")
+                st.subheader("Original (visual)")
                 if item.get("original_html"):
                     components.html(item["original_html"], height=350, scrolling=True)
                 else:
                     st.info("No HTML body for this item.")
-                st.caption("Original HTML")
-                st.code(item.get("original_html", ""), language="html")
 
             with col2:
-                st.subheader("Proposed (rendered)")
+                st.subheader("Proposed (visual)")
                 if has_rewrite:
                     components.html(item["rewritten_html"], height=350, scrolling=True)
-                    st.caption("Proposed HTML (you can edit before approving)")
-                    edited = st.text_area(
-                        "Edit proposed HTML:",
-                        value=item["rewritten_html"],
-                        height=200,
-                        key=f"edited_{i}",
-                    )
-                    item["rewritten_html"] = edited
+                    st.caption("Proposed version based on model + instructions.")
                 else:
                     st.warning("No rewrite available yet. Run the rewrite step above.")
 
@@ -503,11 +522,15 @@ else:
 st.header("Step 5 – Write approved changes back to Canvas")
 
 if st.button("Write approved changes to Canvas"):
-    if not (canvas_base_url and canvas_token and st.session_state["course_id"]):
-        st.error("Canvas base URL, token, and course ID are required (see sidebar).")
+    if not st.session_state["course_id"]:
+        st.error("Target course ID is missing (use the sidebar to load a course).")
     else:
+        base_url, token = get_canvas_config()
         course_id = st.session_state["course_id"]
-        approved_items = [it for it in st.session_state["content_items"] if it.get("approved") and it.get("rewritten_html")]
+        approved_items = [
+            it for it in st.session_state["content_items"]
+            if it.get("approved") and it.get("rewritten_html")
+        ]
 
         if not approved_items:
             st.warning("No approved items with rewritten HTML to write back.")
@@ -518,24 +541,24 @@ if st.button("Write approved changes to Canvas"):
                     try:
                         if item["type"] == "page":
                             update_page_html(
-                                canvas_base_url,
-                                canvas_token,
+                                base_url,
+                                token,
                                 course_id,
                                 item["url_slug"],
                                 item["rewritten_html"],
                             )
                         elif item["type"] == "assignment":
                             update_assignment_html(
-                                canvas_base_url,
-                                canvas_token,
+                                base_url,
+                                token,
                                 course_id,
                                 item["canvas_id"],
                                 item["rewritten_html"],
                             )
                         elif item["type"] == "discussion":
                             update_discussion_html(
-                                canvas_base_url,
-                                canvas_token,
+                                base_url,
+                                token,
                                 course_id,
                                 item["canvas_id"],
                                 item["rewritten_html"],
