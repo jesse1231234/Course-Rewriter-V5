@@ -1,0 +1,551 @@
+# app.py
+import os
+import textwrap
+from typing import List, Dict, Any, Optional
+
+import requests
+import streamlit as st
+import streamlit.components.v1 as components
+from openai import OpenAI
+
+# ---------- CONFIG / CLIENTS ----------
+
+def get_openai_client() -> OpenAI:
+    api_key = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        st.error("OPENAI_API_KEY is not set in environment or Streamlit secrets.")
+        st.stop()
+    return OpenAI(api_key=api_key)
+
+
+# ---------- CANVAS HELPERS ----------
+
+def canvas_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+def get_course(base_url: str, token: str, course_id: str) -> Dict[str, Any]:
+    url = f"{base_url}/api/v1/courses/{course_id}"
+    resp = requests.get(url, headers=canvas_headers(token))
+    resp.raise_for_status()
+    return resp.json()
+
+def get_pages(base_url: str, token: str, course_id: str, max_items: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Return list of full page objects (with body)."""
+    headers = canvas_headers(token)
+    items = []
+    url = f"{base_url}/api/v1/courses/{course_id}/pages"
+    params = {"per_page": 100}
+
+    while url:
+        resp = requests.get(url, headers=headers, params=params)
+        resp.raise_for_status()
+        for page in resp.json():
+            # Need a second call to get full body
+            detail_url = f"{base_url}/api/v1/courses/{course_id}/pages/{page['url']}"
+            detail_resp = requests.get(detail_url, headers=headers)
+            detail_resp.raise_for_status()
+            full_page = detail_resp.json()
+            items.append(full_page)
+            if max_items and len(items) >= max_items:
+                return items
+
+        # Pagination – Canvas uses Link header
+        link = resp.headers.get("Link", "")
+        next_url = None
+        for part in link.split(","):
+            if 'rel="next"' in part:
+                next_url = part[part.find("<")+1:part.find(">")]
+                break
+        url = next_url
+
+    return items
+
+def get_assignments(base_url: str, token: str, course_id: str, max_items: Optional[int] = None) -> List[Dict[str, Any]]:
+    headers = canvas_headers(token)
+    items = []
+    url = f"{base_url}/api/v1/courses/{course_id}/assignments"
+    params = {"per_page": 100}
+
+    while url:
+        resp = requests.get(url, headers=headers, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        items.extend(data)
+        if max_items and len(items) >= max_items:
+            return items[:max_items]
+
+        link = resp.headers.get("Link", "")
+        next_url = None
+        for part in link.split(","):
+            if 'rel="next"' in part:
+                next_url = part[part.find("<")+1:part.find(">")]
+                break
+        url = next_url
+
+    return items
+
+def get_discussions(base_url: str, token: str, course_id: str, max_items: Optional[int] = None) -> List[Dict[str, Any]]:
+    headers = canvas_headers(token)
+    items = []
+    url = f"{base_url}/api/v1/courses/{course_id}/discussion_topics"
+    params = {"per_page": 100}
+
+    while url:
+        resp = requests.get(url, headers=headers, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        items.extend(data)
+        if max_items and len(items) >= max_items:
+            return items[:max_items]
+
+        link = resp.headers.get("Link", "")
+        next_url = None
+        for part in link.split(","):
+            if 'rel="next"' in part:
+                next_url = part[part.find("<")+1:part.find(">")]
+                break
+        url = next_url
+
+    return items
+
+
+def update_page_html(base_url: str, token: str, course_id: str, url_slug: str, html: str) -> None:
+    # PUT /api/v1/courses/:course_id/pages/:url with wiki_page[body]:contentReference[oaicite:8]{index=8}
+    endpoint = f"{base_url}/api/v1/courses/{course_id}/pages/{url_slug}"
+    payload = {"wiki_page": {"body": html}}
+    resp = requests.put(endpoint, headers=canvas_headers(token), json=payload)
+    resp.raise_for_status()
+
+
+def update_assignment_html(base_url: str, token: str, course_id: str, assignment_id: int, html: str) -> None:
+    # PUT /api/v1/courses/:course_id/assignments/:id with assignment[description]:contentReference[oaicite:9]{index=9}
+    endpoint = f"{base_url}/api/v1/courses/{course_id}/assignments/{assignment_id}"
+    payload = {"assignment": {"description": html}}
+    resp = requests.put(endpoint, headers=canvas_headers(token), json=payload)
+    resp.raise_for_status()
+
+
+def update_discussion_html(base_url: str, token: str, course_id: str, topic_id: int, html: str) -> None:
+    # PUT /api/v1/courses/:course_id/discussion_topics/:topic_id with message:contentReference[oaicite:10]{index=10}
+    endpoint = f"{base_url}/api/v1/courses/{course_id}/discussion_topics/{topic_id}"
+    payload = {"message": html}
+    resp = requests.put(endpoint, headers=canvas_headers(token), json=payload)
+    resp.raise_for_status()
+
+
+# ---------- OPENAI HELPERS ----------
+
+def build_rewrite_prompt(
+    item: Dict[str, Any],
+    model_context: str,
+    global_instructions: str,
+) -> str:
+    """Build a single string prompt for the Responses API."""
+    model_context = (model_context or "").strip()
+    # Truncate model context for safety
+    max_model_chars = 12000
+    if len(model_context) > max_model_chars:
+        model_context = model_context[:max_model_chars] + "\n\n[Model context truncated for length.]"
+
+    base_rules = textwrap.dedent(
+        """
+        You are an assistant that rewrites Canvas LMS HTML content.
+
+        Requirements:
+        - Preserve semantics and learning intent of the original.
+        - Preserve all external links, images, iframes, LTI embeds, and data-* attributes.
+        - If the original HTML contains comments or elements that look like AI instructions
+          (e.g., <!--AI: ... -->), use them as guidance but DO NOT include them in the output.
+        - Do not remove Canvas-specific shortcodes, variables, or LTI launch code.
+        - Return ONLY valid HTML (no Markdown, no backticks).
+        """
+    )
+
+    item_html = item.get("original_html", "")
+    item_type = item.get("type", "page")
+    title = item.get("title", "")
+
+    prompt = f"""
+    {base_rules}
+
+    ### Global instructions from the user
+    {global_instructions or "If no additional instructions, just clean up structure and align with the model course style."}
+
+    ### Model course/style examples
+    {model_context}
+
+    ### Target item metadata
+    - Type: {item_type}
+    - Title: {title}
+
+    ### Original HTML
+    {item_html}
+
+    ### Output
+    Rewrite the HTML above according to the global instructions and style of the model course.
+    Return ONLY the rewritten HTML.
+    """.strip()
+
+    return prompt
+
+
+def rewrite_item(
+    client: OpenAI,
+    item: Dict[str, Any],
+    model_context: str,
+    global_instructions: str,
+) -> str:
+    prompt = build_rewrite_prompt(item, model_context, global_instructions)
+    resp = client.responses.create(
+        model="gpt-4.1-mini",
+        input=prompt,
+    )
+    # Responses API: take the first text output
+    out = resp.output[0].content[0].text  # type: ignore[attr-defined]
+    return out.strip()
+
+
+# ---------- STREAMLIT STATE INIT ----------
+
+if "content_items" not in st.session_state:
+    st.session_state["content_items"] = []  # list of dicts
+
+if "model_context" not in st.session_state:
+    st.session_state["model_context"] = ""
+
+if "course_id" not in st.session_state:
+    st.session_state["course_id"] = None
+
+if "rewrite_done" not in st.session_state:
+    st.session_state["rewrite_done"] = False
+
+
+# ---------- UI: SIDEBAR CONFIG ----------
+
+st.set_page_config(page_title="Canvas Course Rewriter", layout="wide")
+st.title("Canvas Course Rewriter (Streamlit)")
+
+st.sidebar.header("Canvas connection")
+canvas_base_url = st.sidebar.text_input(
+    "Canvas base URL",
+    help="Example: https://colostate.instructure.com",
+)
+canvas_token = st.sidebar.text_input(
+    "Canvas API token",
+    type="password",
+    help="A personal access token or OAuth token with permission to read/write course content.",
+)
+target_course_id = st.sidebar.text_input(
+    "Target course ID",
+    help="Numeric ID from the Canvas course URL (e.g. .../courses/205033).",
+)
+
+if st.sidebar.button("Fetch course content"):
+
+    if not (canvas_base_url and canvas_token and target_course_id):
+        st.sidebar.error("Please provide base URL, token, and course ID.")
+    else:
+        try:
+            with st.spinner("Fetching pages, assignments, and discussions from Canvas…"):
+                # verify course exists (optional)
+                _ = get_course(canvas_base_url, canvas_token, target_course_id)
+
+                pages = get_pages(canvas_base_url, canvas_token, target_course_id)
+                assignments = get_assignments(canvas_base_url, canvas_token, target_course_id)
+                discussions = get_discussions(canvas_base_url, canvas_token, target_course_id)
+
+                content_items: List[Dict[str, Any]] = []
+
+                for p in pages:
+                    content_items.append(
+                        {
+                            "type": "page",
+                            "id": p["page_id"],   # internal id
+                            "canvas_id": p["page_id"],
+                            "url_slug": p["url"],
+                            "title": p["title"],
+                            "original_html": p.get("body", "") or "",
+                            "rewritten_html": "",
+                            "approved": False,
+                        }
+                    )
+
+                for a in assignments:
+                    content_items.append(
+                        {
+                            "type": "assignment",
+                            "id": a["id"],
+                            "canvas_id": a["id"],
+                            "title": a["name"],
+                            "original_html": a.get("description", "") or "",
+                            "rewritten_html": "",
+                            "approved": False,
+                        }
+                    )
+
+                for d in discussions:
+                    content_items.append(
+                        {
+                            "type": "discussion",
+                            "id": d["id"],
+                            "canvas_id": d["id"],
+                            "title": d["title"],
+                            "original_html": d.get("message", "") or "",
+                            "rewritten_html": "",
+                            "approved": False,
+                        }
+                    )
+
+                st.session_state["content_items"] = content_items
+                st.session_state["course_id"] = target_course_id
+                st.session_state["rewrite_done"] = False
+
+            st.success(f"Loaded {len(content_items)} items from course {target_course_id}.")
+
+        except Exception as e:
+            st.sidebar.error(f"Error fetching content: {e}")
+
+
+# ---------- STEP 2: MODEL INPUT ----------
+
+st.header("Step 2 – Provide model course/style")
+
+model_source = st.radio(
+    "How do you want to provide a model?",
+    ["Paste HTML/JSON", "Upload a file", "Use Canvas model course"],
+    horizontal=True,
+)
+
+if model_source == "Paste HTML/JSON":
+    pasted = st.text_area(
+        "Paste HTML, JSON, or other structured description of your model course/style:",
+        height=200,
+        key="pasted_model",
+    )
+    if st.button("Use this as model"):
+        st.session_state["model_context"] = pasted or ""
+        st.success("Model context updated from pasted content.")
+
+elif model_source == "Upload a file":
+    uploaded = st.file_uploader(
+        "Upload an HTML / JSON / TXT file that represents your model course/style.",
+        type=["html", "htm", "json", "txt"],
+    )
+    if uploaded is not None and st.button("Use uploaded file as model"):
+        content = uploaded.read().decode("utf-8", errors="ignore")
+        st.session_state["model_context"] = content
+        st.success("Model context loaded from uploaded file.")
+
+elif model_source == "Use Canvas model course":
+    model_course_id = st.text_input(
+        "Model course ID (numeric, from Canvas URL)",
+        key="model_course_id",
+    )
+    max_model_items = st.number_input(
+        "Max items to pull from model course (total across types)",
+        min_value=3,
+        max_value=50,
+        value=10,
+        step=1,
+    )
+    if st.button("Fetch model course content"):
+        if not (canvas_base_url and canvas_token and model_course_id):
+            st.error("Canvas base URL, token, and model course ID are required.")
+        else:
+            try:
+                with st.spinner("Fetching model course content…"):
+                    # Simple strategy: a few pages, assignments, discussions
+                    pages_m = get_pages(canvas_base_url, canvas_token, model_course_id, max_items=max_model_items)
+                    assignments_m = get_assignments(canvas_base_url, canvas_token, model_course_id, max_items=max_model_items)
+                    discussions_m = get_discussions(canvas_base_url, canvas_token, model_course_id, max_items=max_model_items)
+
+                    model_snippets = []
+
+                    for p in pages_m[:max_model_items]:
+                        model_snippets.append(f"### [page] {p['title']}\n{p.get('body', '')}")
+
+                    for a in assignments_m[:max_model_items]:
+                        model_snippets.append(f"### [assignment] {a['name']}\n{a.get('description', '')}")
+
+                    for d in discussions_m[:max_model_items]:
+                        model_snippets.append(f"### [discussion] {d['title']}\n{d.get('message', '')}")
+
+                    model_context = "\n\n".join(model_snippets)
+                    st.session_state["model_context"] = model_context
+
+                st.success("Model context built from Canvas model course.")
+
+            except Exception as e:
+                st.error(f"Error fetching model course: {e}")
+
+
+if st.session_state["model_context"]:
+    with st.expander("Preview current model context", expanded=False):
+        st.text_area(
+            "Model context (trimmed preview):",
+            value=st.session_state["model_context"][:4000],
+            height=200,
+        )
+
+
+# ---------- STEP 3: CONFIGURE & RUN REWRITE ----------
+
+st.header("Step 3 – Rewrite course content with OpenAI")
+
+global_instructions = st.text_area(
+    "High-level rewrite instructions (optional but recommended):",
+    placeholder="E.g., Use CSU Online page template, standardize headings, add Outcomes/Instructions/Next Steps sections, etc.",
+    height=150,
+    key="global_instructions",
+)
+
+can_run_rewrite = bool(
+    st.session_state["content_items"]
+    and st.session_state["model_context"]
+)
+
+if st.button("Run rewrite on all items", disabled=not can_run_rewrite):
+    client = get_openai_client()
+    items = st.session_state["content_items"]
+    model_context = st.session_state["model_context"]
+
+    progress = st.progress(0.0)
+    status_area = st.empty()
+
+    for idx, item in enumerate(items):
+        status_area.write(f"Rewriting [{item['type']}] {item['title']}…")
+        try:
+            if item.get("original_html"):
+                rewritten = rewrite_item(client, item, model_context, global_instructions)
+                item["rewritten_html"] = rewritten
+            else:
+                item["rewritten_html"] = ""
+        except Exception as e:
+            item["rewrite_error"] = str(e)
+
+        progress.progress((idx + 1) / len(items))
+
+    st.session_state["content_items"] = items
+    st.session_state["rewrite_done"] = True
+    status_area.write("Rewrite complete.")
+
+
+# ---------- STEP 4: REVIEW & APPROVAL ----------
+
+st.header("Step 4 – Review and approve changes")
+
+items = st.session_state["content_items"]
+
+if not items:
+    st.info("Load course content first using the sidebar.")
+else:
+    for i, item in enumerate(items):
+        has_rewrite = bool(item.get("rewritten_html"))
+        label = f"[{item['type']}] {item['title']}"
+        with st.expander(label, expanded=False):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("Original (rendered)")
+                if item.get("original_html"):
+                    components.html(item["original_html"], height=350, scrolling=True)
+                else:
+                    st.info("No HTML body for this item.")
+                st.caption("Original HTML")
+                st.code(item.get("original_html", ""), language="html")
+
+            with col2:
+                st.subheader("Proposed (rendered)")
+                if has_rewrite:
+                    components.html(item["rewritten_html"], height=350, scrolling=True)
+                    st.caption("Proposed HTML (you can edit before approving)")
+                    edited = st.text_area(
+                        "Edit proposed HTML:",
+                        value=item["rewritten_html"],
+                        height=200,
+                        key=f"edited_{i}",
+                    )
+                    item["rewritten_html"] = edited
+                else:
+                    st.warning("No rewrite available yet. Run the rewrite step above.")
+
+            approved = st.checkbox(
+                "Approve this change",
+                value=item.get("approved", False),
+                key=f"approved_{i}",
+            )
+            item["approved"] = approved
+
+    # Write back the mutated list
+    st.session_state["content_items"] = items
+
+    # Bulk helpers
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Approve ALL items with proposed HTML"):
+            for item in st.session_state["content_items"]:
+                if item.get("rewritten_html"):
+                    item["approved"] = True
+            st.success("All items with proposed HTML marked as approved.")
+
+    with col_b:
+        if st.button("Clear ALL approvals"):
+            for item in st.session_state["content_items"]:
+                item["approved"] = False
+            st.info("All approvals cleared.")
+
+
+# ---------- STEP 5: WRITE BACK TO CANVAS ----------
+
+st.header("Step 5 – Write approved changes back to Canvas")
+
+if st.button("Write approved changes to Canvas"):
+    if not (canvas_base_url and canvas_token and st.session_state["course_id"]):
+        st.error("Canvas base URL, token, and course ID are required (see sidebar).")
+    else:
+        course_id = st.session_state["course_id"]
+        approved_items = [it for it in st.session_state["content_items"] if it.get("approved") and it.get("rewritten_html")]
+
+        if not approved_items:
+            st.warning("No approved items with rewritten HTML to write back.")
+        else:
+            with st.spinner(f"Writing {len(approved_items)} items back to Canvas…"):
+                errors = []
+                for item in approved_items:
+                    try:
+                        if item["type"] == "page":
+                            update_page_html(
+                                canvas_base_url,
+                                canvas_token,
+                                course_id,
+                                item["url_slug"],
+                                item["rewritten_html"],
+                            )
+                        elif item["type"] == "assignment":
+                            update_assignment_html(
+                                canvas_base_url,
+                                canvas_token,
+                                course_id,
+                                item["canvas_id"],
+                                item["rewritten_html"],
+                            )
+                        elif item["type"] == "discussion":
+                            update_discussion_html(
+                                canvas_base_url,
+                                canvas_token,
+                                course_id,
+                                item["canvas_id"],
+                                item["rewritten_html"],
+                            )
+                    except Exception as e:
+                        errors.append((item["title"], str(e)))
+
+            if errors:
+                st.error("Some items failed to update:")
+                for title, msg in errors:
+                    st.write(f"- **{title}**: {msg}")
+            else:
+                st.success("All approved items successfully written back to Canvas.")
