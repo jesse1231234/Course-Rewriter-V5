@@ -186,15 +186,18 @@ def build_rewrite_prompt(
 
     base_rules = textwrap.dedent(
         """
-        You are an assistant that rewrites Canvas LMS HTML content.
+        You are an expert Canvas HTML editor. Preserve links and anchors/IDs
 
         Requirements:
         - Preserve semantics and learning intent of the original.
-        - Preserve all external links, images, iframes, LTI embeds, and data-* attributes.
-        - If the original HTML contains comments or elements that look like AI instructions
-          (e.g., <!--AI: ... -->), use them as guidance but DO NOT include them in the output.
-        - Do not remove Canvas-specific shortcodes, variables, or LTI launch code.
-        - Return ONLY valid HTML (no Markdown, no backticks).
+        - Placeholders like ⟪IFRAME:n⟫ represent protected iframes—do not add, remove, or reorder them.
+        - Follow the policy. Return only HTML, no explanations.
+        - Reformat the HTML using DesignPLUS styling.
+        - Do not change the written content of the page, only the design.
+        - Use Colorado State University branding colors.
+        - Use the DesignPLUS theme from the model provided.
+        - Place all iframes within DesignPLUS accordions.
+        - The focus is on styling, structure, and accessibility — not changing the content.
         """
     )
 
