@@ -5,17 +5,49 @@ from typing import List, Dict, Any, Optional
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-from openai import OpenAI
+from openai import AzureOpenAI
 
 
 # ---------- CONFIG / CLIENTS ----------
 
-def get_openai_client() -> OpenAI:
-    api_key = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        st.error("OPENAI_API_KEY is not set in environment or Streamlit secrets.")
+def get_azure_openai_client() -> AzureOpenAI:
+    """
+    Create an Azure OpenAI client from Streamlit secrets / env vars.
+
+    Required config (Streamlit secrets OR environment variables):
+      - AZURE_OPENAI_ENDPOINT  e.g. "https://my-resource.openai.azure.com/"
+      - AZURE_OPENAI_API_KEY   e.g. the key from the Azure OpenAI resource
+      - AZURE_OPENAI_API_VERSION  e.g. "2024-02-01"
+      - AZURE_OPENAI_DEPLOYMENT  the deployment name of your model (e.g. "gpt-4.1-mini-801")
+    """
+    endpoint = (
+        st.secrets.get("AZURE_OPENAI_ENDPOINT", None)
+        or os.getenv("AZURE_OPENAI_ENDPOINT")
+    )
+    api_key = (
+        st.secrets.get("AZURE_OPENAI_API_KEY", None)
+        or os.getenv("AZURE_OPENAI_API_KEY")
+    )
+    api_version = (
+        st.secrets.get("AZURE_OPENAI_API_VERSION", None)
+        or os.getenv("AZURE_OPENAI_API_VERSION")
+        or "2024-02-01"
+    )
+
+    if not endpoint or not api_key:
+        st.error(
+            "Azure OpenAI configuration missing. "
+            "Please set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY "
+            "in Streamlit secrets or environment."
+        )
         st.stop()
-    return OpenAI(api_key=api_key)
+
+    client = AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_key=api_key,
+        api_version=api_version,
+    )
+    return client
 
 
 def get_canvas_config() -> tuple[str, str]:
@@ -229,19 +261,42 @@ def build_rewrite_prompt(
 
 
 def rewrite_item(
-    client: OpenAI,
+    client: AzureOpenAI,
     item: Dict[str, Any],
     model_context: str,
     global_instructions: str,
 ) -> str:
+    """
+    Call your Azure OpenAI deployment to rewrite a single item.
+    Uses Chat Completions API with a single user message containing the prompt.
+    """
     prompt = build_rewrite_prompt(item, model_context, global_instructions)
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
-        input=prompt,
+
+    deployment_name = (
+        st.secrets.get("AZURE_OPENAI_DEPLOYMENT", None)
+        or os.getenv("AZURE_OPENAI_DEPLOYMENT")
     )
-    # Responses API: take the first text output
-    out = resp.output[0].content[0].text  # type: ignore[attr-defined]
+    if not deployment_name:
+        st.error(
+            "AZURE_OPENAI_DEPLOYMENT is not set. "
+            "This should be the deployment name of your model in Azure."
+        )
+        st.stop()
+
+    resp = client.chat.completions.create(
+        model=deployment_name,  # deployment name, NOT the raw model name
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        temperature=0,  # deterministic; adjust if you want more variation
+    )
+
+    out = resp.choices[0].message.content or ""
     return out.strip()
+
 
 
 # ---------- STREAMLIT STATE INIT ----------
@@ -423,7 +478,7 @@ if st.session_state["model_context"]:
 
 # ---------- STEP 3: CONFIGURE & RUN REWRITE ----------
 
-st.header("Step 3 – Rewrite course content with OpenAI")
+st.header("Step 3 – Rewrite course content with Azure OpenAI")
 
 global_instructions = st.text_area(
     "High-level rewrite instructions (optional but recommended):",
@@ -438,7 +493,7 @@ can_run_rewrite = bool(
 )
 
 if st.button("Run rewrite on all items", disabled=not can_run_rewrite):
-    client = get_openai_client()
+    client = get_azure_openai_client()
     items = st.session_state["content_items"]
     model_context = st.session_state["model_context"]
 
