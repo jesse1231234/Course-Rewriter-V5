@@ -5,47 +5,39 @@ from typing import List, Dict, Any, Optional
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-from openai import AzureOpenAI
+from openai import OpenAI
 
 
 # ---------- CONFIG / CLIENTS ----------
 
-def get_azure_openai_client() -> AzureOpenAI:
+def get_ai_client() -> OpenAI:
     """
-    Create an Azure OpenAI client from Streamlit secrets / env vars.
+    Create an OpenAI client for an Azure AI Foundry / Project endpoint.
 
-    Required config (Streamlit secrets OR environment variables):
-      - AZURE_OPENAI_ENDPOINT  e.g. "https://my-resource.openai.azure.com/"
-      - AZURE_OPENAI_API_KEY   e.g. the key from the Azure OpenAI resource
-      - AZURE_OPENAI_API_VERSION  e.g. "2024-02-01"
-      - AZURE_OPENAI_DEPLOYMENT  the deployment name of your model (e.g. "gpt-4.1-mini-801")
+    Required config (Streamlit secrets OR env vars):
+      - OPENAI_BASE_URL  e.g. "https://<something>.services.ai.azure.com/openai/v1"
+      - OPENAI_API_KEY   e.g. the key from the Foundry 'Use this model' / 'Connections' blade
     """
-    endpoint = (
-        st.secrets.get("AZURE_OPENAI_ENDPOINT", None)
-        or os.getenv("AZURE_OPENAI_ENDPOINT")
+    base_url = (
+        st.secrets.get("OPENAI_BASE_URL", None)
+        or os.getenv("OPENAI_BASE_URL")
     )
     api_key = (
-        st.secrets.get("AZURE_OPENAI_API_KEY", None)
-        or os.getenv("AZURE_OPENAI_API_KEY")
-    )
-    api_version = (
-        st.secrets.get("AZURE_OPENAI_API_VERSION", None)
-        or os.getenv("AZURE_OPENAI_API_VERSION")
-        or "2024-02-01"
+        st.secrets.get("OPENAI_API_KEY", None)
+        or os.getenv("OPENAI_API_KEY")
     )
 
-    if not endpoint or not api_key:
+    if not base_url or not api_key:
         st.error(
-            "Azure OpenAI configuration missing. "
-            "Please set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY "
+            "OpenAI configuration missing. "
+            "Please set OPENAI_BASE_URL and OPENAI_API_KEY "
             "in Streamlit secrets or environment."
         )
         st.stop()
 
-    client = AzureOpenAI(
-        azure_endpoint=endpoint,
+    client = OpenAI(
+        base_url=base_url,
         api_key=api_key,
-        api_version=api_version,
     )
     return client
 
@@ -261,30 +253,32 @@ def build_rewrite_prompt(
 
 
 def rewrite_item(
-    client: AzureOpenAI,
+    client: OpenAI,
     item: Dict[str, Any],
     model_context: str,
     global_instructions: str,
 ) -> str:
     """
-    Call your Azure OpenAI deployment to rewrite a single item.
+    Call your Azure AI Foundry deployment via the OpenAI client to rewrite a single item.
     Uses Chat Completions API with a single user message containing the prompt.
     """
     prompt = build_rewrite_prompt(item, model_context, global_instructions)
 
-    deployment_name = (
-        st.secrets.get("AZURE_OPENAI_DEPLOYMENT", None)
-        or os.getenv("AZURE_OPENAI_DEPLOYMENT")
+    # Model identifier should be the *deployment name* from Foundry,
+    # same value that worked for your dashboard (e.g. "gpt-4.1-dashboard").
+    model_name = (
+        st.secrets.get("OPENAI_MODEL", None)
+        or os.getenv("OPENAI_MODEL")
     )
-    if not deployment_name:
+    if not model_name:
         st.error(
-            "AZURE_OPENAI_DEPLOYMENT is not set. "
-            "This should be the deployment name of your model in Azure."
+            "OPENAI_MODEL is not set. "
+            "Set it to your model deployment name from Azure (Deployment Info → Name)."
         )
         st.stop()
 
     resp = client.chat.completions.create(
-        model=deployment_name,  # deployment name, NOT the raw model name
+        model=model_name,
         messages=[
             {
                 "role": "user",
@@ -493,7 +487,7 @@ can_run_rewrite = bool(
 )
 
 if st.button("Run rewrite on all items", disabled=not can_run_rewrite):
-    client = get_azure_openai_client()
+    client = get_ai_client()
     items = st.session_state["content_items"]
     model_context = st.session_state["model_context"]
 
